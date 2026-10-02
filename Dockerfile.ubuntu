@@ -1,0 +1,170 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS source
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gpgv xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://downloads.isc.org/isc/bind9/${VERSION}/bind-${VERSION}.tar.xz /src/
+ADD https://downloads.isc.org/isc/bind9/${VERSION}/bind-${VERSION}.tar.xz.asc /src/
+# ISC's code-signing keys, from https://www.isc.org/docs/isc-keyblock.asc:
+#   706B 6C28 620E 76F9 1D11 F7DF 510A 642A 06C5 2CEC  Michał Kępień
+#   D99C CEAF 8797 4701 4F03 8D63 182E 2357 9462 EFAA  Michal Nowak
+#   0259 A33B 5F5A 3A44 66CF 345C 7A5E 084C ACA5 1884  Wlodek Wencel
+#   090A 2A07 923F 925B 5767 803A 42E5 DF78 C832 71DB  Marcin Godzina
+#   9580 D6BF 2CC8 0F1E 3BB1 1252 DEAB 91D5 4B13 C9B8  Greg Choules
+#   FC87 4C3E 3FE8 6770 70AC 71BE B5EF F6AC 7E1A DDF8  Cathy Almond
+#   DA6A 3508 E672 A49D D382 AFD9 5B8F 4D91 B88E D909  Andrei Pavel
+# A release signed by anyone else fails the gpgv check below until their key
+# is added to keys/isc-keyblock.gpg.
+COPY keys/isc-keyblock.gpg /tmp/isc-keyblock.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/isc-keyblock.gpg "bind-${VERSION}.tar.xz.asc" "bind-${VERSION}.tar.xz"; \
+    mkdir bind; \
+    tar -xJf "bind-${VERSION}.tar.xz" -C bind --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's own packages are recorded first so they can be left out of
+# runtime-deps; every image built from this list starts from the same base.
+# libcap is only used by named, but configure requires it on Linux.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      libcap-dev \
+      libedit-dev \
+      libidn2-dev \
+      libkrb5-dev \
+      libnghttp2-dev \
+      libssl-dev \
+      liburcu-dev \
+      libuv1-dev \
+      perl \
+      pkgconf; \
+    rm -rf /var/lib/apt/lists/*
+COPY --link --from=source /src/bind /src/bind
+WORKDIR /src/bind
+
+# The tarball ships configure and the man pages, so neither the autotools nor
+# Sphinx are needed, and maintainer mode, which the release's configure enables
+# by default, is disabled so make never reruns the autotools. Libraries that
+# only named uses (jemalloc, libxml2, json-c, LMDB, zlib, MaxMind DB), dnstap
+# and USDT probes are switched off so configure does not pick them up. The
+# features the client tools use make configure fail when their library is
+# missing; config.h is checked anyway.
+ARG JOBS
+RUN ./configure \
+      --prefix=/usr/local \
+      --sysconfdir=/etc/bind \
+      --localstatedir=/var \
+      --disable-maintainer-mode \
+      --enable-shared \
+      --disable-static \
+      --enable-doh \
+      --with-libnghttp2 \
+      --with-libidn2 \
+      --with-readline=libedit \
+      --with-gssapi \
+      --without-jemalloc \
+      --without-lmdb \
+      --without-json-c \
+      --without-libxml2 \
+      --without-zlib \
+      --without-cmocka \
+      --disable-geoip \
+      --disable-dnstap \
+      --disable-tracing; \
+    for f in HAVE_LIBNGHTTP2 HAVE_LIBIDN2 HAVE_READLINE_LIBEDIT HAVE_GSSAPI; do \
+      grep -q "^#define $f 1" config.h || { echo "configure left out $f" >&2; exit 1; }; \
+    done; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make install DESTDIR=/stage
+
+# Only the client tools and the four libraries they load go into the image:
+# named, the other programs, headers, libtool files, the unversioned library
+# links and the man pages stay behind.
+ARG BASE_IMAGE
+ARG VERSION
+# LICENSE and COPYRIGHT do not cover all the code compiled into the libraries:
+# NOTICES adds the notices of SipHash, picohttpparser, the C-RW-WP lock,
+# strnstr and the NLnet Labs duration code, each cut from its source file.
+# runtime-deps lists the packages that own the libraries the tools load, minus
+# the base image's packages, plus the packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    install -d /out/usr/local/bin /out/usr/local/lib; \
+    for tool in dig host nslookup delv nsupdate mdig; do \
+      cp "/stage/usr/local/bin/$tool" /out/usr/local/bin/; \
+    done; \
+    for lib in isc dns isccfg ns; do \
+      cp "/stage/usr/local/lib/lib$lib-${VERSION}.so" /out/usr/local/lib/; \
+    done; \
+    strip --strip-unneeded /out/usr/local/bin/* /out/usr/local/lib/*; \
+    check() { \
+      got="$(LD_LIBRARY_PATH=/out/usr/local/lib "/out/usr/local/bin/$1" "$2")" || { echo "$1 $2 failed" >&2; exit 1; }; \
+      test "$got" = "$3 ${VERSION}" || { echo "$1 $2 printed: $got" >&2; exit 1; }; \
+    }; \
+    check dig -v DiG; \
+    check host -V host; \
+    check nslookup -version nslookup; \
+    check delv -v delv; \
+    check nsupdate -V nsupdate; \
+    check mdig -v mDiG; \
+    meta=/out/usr/local/share/randomcontainers/dig; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE COPYRIGHT "$meta/licenses/"; \
+    for f in lib/isc/include/isc/siphash.h lib/isc/picohttpparser.c lib/isc/rwlock.c lib/isc/string.c lib/isccfg/parser.c; do \
+      awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Copyright [(][Cc][)]/ && b !~ /Internet Systems Consortium/) { printf "%s", b; exit } }' \
+        "$f" > /tmp/notice; \
+      test -s /tmp/notice || { echo "no third-party notice in $f" >&2; exit 1; }; \
+      printf '%s:\n\n' "$f"; cat /tmp/notice; echo; \
+    done > "$meta/licenses/NOTICES"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://downloads.isc.org/isc/bind9/${VERSION}/bind-${VERSION}.tar.xz" \
+      "https://downloads.isc.org/isc/bind9/${VERSION}/bind-${VERSION}.tar.xz.asc" \
+      "https://github.com/randomcontainers/dig/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      sed -n 's/^  \$ \(\.\/configure .*\)/\1/p' config.log; \
+      LD_LIBRARY_PATH=/stage/usr/local/lib /stage/usr/local/sbin/named -V | grep -E '^(compiled with|linked to) '; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f \( -perm -u+x -o -name '*.so*' \) -print0 \
+      | xargs -0 env LD_LIBRARY_PATH=/out/usr/local/lib ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | LC_ALL=C sort -u > /tmp/libs; \
+    for l in libnghttp2 libidn2 libedit libgssapi_krb5; do \
+      grep -q "/$l\.so\." /tmp/libs || { echo "no tool loads $l" >&2; exit 1; }; \
+    done; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/dig/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+# The BIND libraries are in /usr/local/lib, which the loader searches only
+# through the cache that ldconfig writes.
+RUN ldconfig
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "dig"]
+CMD ["-h"]
