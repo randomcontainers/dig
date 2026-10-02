@@ -1,0 +1,113 @@
+name: dig
+title: dig (BIND 9 client tools)
+summary: Queries DNS servers with dig, host, nslookup and delv, and sends dynamic updates with nsupdate. Built from the signed ISC BIND 9 release.
+homepage: https://www.isc.org/bind/
+license: MPL-2.0 AND ISC AND BSD-2-Clause AND BSD-3-Clause AND MIT AND CC0-1.0
+source-release: true
+upstream:
+  source: github-tag
+  repository: isc-projects/bind9
+  # Release tags look like v9.20.29. Only the 9.20 series, ISC's extended
+  # support version, is followed: the 9.21 development releases do not match,
+  # and 9.22 builds with meson instead of configure.
+  tag-pattern: '^v9\.20\.(\d+)$'
+  version-template: '9.20.{1}'
+  versioning: semver
+  version: 9.20.29
+  artifact:
+    url: https://downloads.isc.org/isc/bind9/{version}/bind-{version}.tar.xz
+    signature: https://downloads.isc.org/isc/bind9/{version}/bind-{version}.tar.xz.asc
+    sha256: 587029508b3b1b43229fae416c97e5543aba45809cefaca98a5004a02a5736c1
+image:
+  entrypoint: [dig]
+  # Without arguments dig asks the configured resolver for the root servers.
+  cmd: [-h]
+test:
+  - |
+    # Each tool prints its version on standard output.
+    check() {
+      want=$1
+      shift
+      "$@" > version.txt 2> version.err || { cat version.err >&2; echo "$* failed" >&2; exit 1; }
+      got=$(cat version.txt)
+      if [ "$got" != "$want" ]; then
+        cat version.err >&2
+        echo "$*: expected '$want', got '$got'" >&2
+        exit 1
+      fi
+    }
+    check "DiG $VERSION" dig -v
+    check "host $VERSION" host -V
+    check "nslookup $VERSION" nslookup -version
+    check "delv $VERSION" delv -v
+    check "nsupdate $VERSION" nsupdate -V
+    check "mDiG $VERSION" mdig -v
+    dig -h > help.txt
+    grep -q '^Usage:  dig ' help.txt || { cat help.txt >&2; exit 1; }
+  - |
+    # Nothing listens on 127.0.0.1, so the query fails after it is sent and dig
+    # exits with 9. +qr prints the query as sent, here signed with a TSIG key
+    # (HMAC-SHA256 from OpenSSL).
+    rc=0
+    dig +qr +tries=1 +time=1 -y hmac-sha256:example-key:c2VjcmV0LWZvci10aGUtdGVzdA== \
+      @127.0.0.1 example.org A > query.txt 2>&1 || rc=$?
+    if [ "$rc" != 9 ]; then cat query.txt >&2; echo "dig exited with $rc, expected 9" >&2; exit 1; fi
+    missing() { cat query.txt >&2; echo "missing: $1" >&2; exit 1; }
+    grep -Fqx ';; Sending:' query.txt || missing 'the query'
+    grep -Eq '^;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: +[0-9]+$' query.txt || missing 'the header'
+    grep -Eq '^;example\.org\.[[:space:]]+IN[[:space:]]+A$' query.txt || missing 'the question'
+    grep -Fqx ';; TSIG PSEUDOSECTION:' query.txt || missing 'the TSIG section'
+    grep -Eq '^example-key\.[[:space:]]+0[[:space:]]+ANY[[:space:]]+TSIG[[:space:]]+hmac-sha256\. ' query.txt \
+      || missing 'the TSIG record'
+    grep -Fq 'no servers could be reached' query.txt || missing 'the error'
+  - |
+    # libidn2 converts the UTF-8 name to its ASCII form before the query is sent.
+    name=$(printf 'm\303\274nchen.de')
+    rc=0
+    LC_ALL=C.UTF-8 dig +qr +noidnout +tries=1 +time=1 @127.0.0.1 "$name" A > idn.txt 2>&1 || rc=$?
+    if [ "$rc" != 9 ] || ! grep -Eq '^;xn--mnchen-3ya\.de\.[[:space:]]+IN[[:space:]]+A$' idn.txt; then
+      cat idn.txt >&2
+      echo "expected the question for xn--mnchen-3ya.de. and exit code 9, got $rc" >&2
+      exit 1
+    fi
+  - |
+    # DNS over HTTPS (nghttp2) and DNS over TLS connect over TCP to ports 443
+    # and 853. Nothing listens there, so dig fails to connect and exits with 9.
+    for mode in https:443 tls:853; do
+      proto=${mode%:*}
+      port=${mode#*:}
+      rc=0
+      dig "+$proto" +tries=1 +time=1 @127.0.0.1 example.org > "$proto.txt" 2>&1 || rc=$?
+      if [ "$rc" != 9 ] || grep -Fq 'not enabled' "$proto.txt" \
+        || ! grep -Eq "(Connection to|communications error to) 127\.0\.0\.1#${port}[(:]" "$proto.txt"; then
+        cat "$proto.txt" >&2
+        echo "dig +$proto exited with $rc, expected a failed connection to port $port" >&2
+        exit 1
+      fi
+    done
+  - |
+    # nsupdate reads a TSIG key file and prints the update it would send. The
+    # input has no send command and no empty line, so nothing is sent.
+    printf '%s\n' 'key "example-key" {' '  algorithm hmac-sha256;' \
+      '  secret "c2VjcmV0LWZvci10aGUtdGVzdA==";' '};' > tsig.key
+    printf '%s\n' 'server 127.0.0.1' 'zone example.org' \
+      'update add www.example.org 300 IN A 192.0.2.1' 'show' > update.txt
+    nsupdate -k tsig.key update.txt > show.txt 2>&1 || { cat show.txt >&2; echo "nsupdate failed" >&2; exit 1; }
+    missing() { cat show.txt >&2; echo "missing: $1" >&2; exit 1; }
+    if grep -Fq 'could not read key' show.txt; then missing 'the key'; fi
+    grep -Fqx 'Outgoing update query:' show.txt || missing 'the update'
+    grep -Eq '^;; ->>HEADER<<- opcode: UPDATE, status: NOERROR, id: +[0-9]+$' show.txt || missing 'the header'
+    grep -Eq '^;example\.org\.[[:space:]]+IN[[:space:]]+SOA$' show.txt || missing 'the zone'
+    grep -Eq '^www\.example\.org\.[[:space:]]+300[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.1$' show.txt \
+      || missing 'the record'
+examples:
+  - title: Print only the addresses of a name
+    command: docker run --rm ghcr.io/randomcontainers/dig +short example.org
+  - title: Ask a public resolver over DNS over HTTPS and check its certificate
+    command: docker run --rm ghcr.io/randomcontainers/dig @dns.quad9.net +https +tls-ca example.org
+  - title: Show the DNSSEC keys of a zone
+    command: docker run --rm ghcr.io/randomcontainers/dig +dnssec +multi isc.org DNSKEY
+  - title: Check the DNSSEC chain of trust of an answer with delv
+    command: docker run --rm --entrypoint delv ghcr.io/randomcontainers/dig isc.org
+  - title: Send a dynamic update signed with a TSIG key
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" --entrypoint nsupdate ghcr.io/randomcontainers/dig -k tsig.key update.txt
